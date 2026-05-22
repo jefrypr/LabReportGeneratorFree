@@ -2,13 +2,13 @@
 """
 Generator teks analisis, kesimpulan, dan langkah kerja via OpenRouter API.
 
-Model assignment:
-  - nvidia/nemotron-super-49b-v1:free  → generate_analysis (tugas berat: analisis + kesimpulan)
-  - cognitivecomputations/dolphin3.0-mistral-24b:free  → generate_langkah_kerja & adjust_content
+Model assignment (semua GRATIS di OpenRouter):
+  MODEL_ANALYSIS  → generate_analysis         (analisis & kesimpulan — tugas berat)
+  MODEL_HELPER    → generate_langkah_kerja    (langkah kerja — tugas ringan)
+                 → adjust_content             (edit konten)
 
-OpenRouter menggunakan endpoint OpenAI-compatible:
-  Base URL : https://openrouter.ai/api/v1
-  Auth     : Bearer <OPENROUTER_API_KEY>
+Cara ganti model: ubah MODEL_ANALYSIS / MODEL_HELPER di bawah.
+Daftar model gratis terkini: https://openrouter.ai/models?q=free
 """
 
 import random
@@ -16,18 +16,23 @@ from openai import OpenAI
 from typing import Generator
 
 # ─── Model Constants ─────────────────────────────────────────────────────────
-# Ganti nilai di sini jika model ID berubah di OpenRouter
-MODEL_ANALYSIS  = "nvidia/nemotron-3-super-49b:free"          # tugas berat: analisis & kesimpulan
-MODEL_HELPER    = "openrouter/owl-alpha"       # tugas ringan: langkah kerja & edit
-
-# MODEL yang diinginkan user (tetap tersedia sebagai alternatif):
-# MODEL_ANALYSIS_ALT = "nvidia/nemotron-3-super-120b-a12b:free"
-# MODEL_HELPER_ALT   = "openrouter/owl-alpha"
-# Cek ketersediaan terkini di: https://openrouter.ai/models?q=free
+#
+# FIX: Model ID harus persis sesuai daftar di openrouter.ai/models
+#
+# ✅ Model yang dipakai (sudah divalidasi tersedia di OpenRouter):
+MODEL_ANALYSIS = "nvidia/nemotron-3-super-120b-a12b:free"   # NVIDIA 120B MoE, gratis
+MODEL_HELPER   = "openrouter/owl-alpha"                      # OpenRouter Owl Alpha, gratis 1.05M ctx
+#
+# Alternatif gratis jika model di atas offline:
+# MODEL_ANALYSIS = "meta-llama/llama-3.3-70b-instruct:free"
+# MODEL_ANALYSIS = "qwen/qwen3-235b-a22b:free"
+# MODEL_HELPER   = "meta-llama/llama-3.1-8b-instruct:free"
+# MODEL_HELPER   = "qwen/qwen3-8b:free"
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
-# ─── System Prompt Global ────────────────────────────────────────────────────
+
+# ─── System Prompt ────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """Kamu adalah asisten akademik untuk penulisan laporan praktikum laboratorium.
 
@@ -117,11 +122,9 @@ def _build_langkah_kerja_prompt(context: dict) -> str:
     percobaan_hint = ""
     if context.get("percobaan_info"):
         percobaan_hint = f"\nDeskripsi percobaan: {context['percobaan_info'][:300]}"
-
     modul_hint = ""
     if context.get("modul_info"):
         modul_hint = f"\nCuplikan modul: {context['modul_info'][:300]}"
-
     return f"""Buat langkah kerja untuk praktikum berikut:
 Mata Praktikum: {context['mata_praktikum']}
 Judul: {context['judul']}{percobaan_hint}{modul_hint}
@@ -151,7 +154,6 @@ Tulis ulang konten tersebut sesuai instruksi. Pertahankan bagian yang tidak perl
 # ─── Client Factory ──────────────────────────────────────────────────────────
 
 def _get_client(api_key: str) -> OpenAI:
-    """Buat OpenAI client yang mengarah ke OpenRouter."""
     return OpenAI(
         api_key=api_key,
         base_url=OPENROUTER_BASE_URL,
@@ -162,18 +164,42 @@ def _get_client(api_key: str) -> OpenAI:
     )
 
 
-# ─── API Functions ────────────────────────────────────────────────────────────
+# ─── Streaming Helper ────────────────────────────────────────────────────────
+
+def _stream(client: OpenAI, model: str, messages: list, temperature: float, max_tokens: int):
+    """Wrapper streaming dengan error yang lebih informatif."""
+    try:
+        stream = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=True,
+        )
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content
+            if delta:
+                yield delta
+    except Exception as e:
+        err = str(e)
+        if "not a valid model" in err or "404" in err:
+            raise ValueError(
+                f"Model '{model}' tidak ditemukan di OpenRouter.\n"
+                f"Cek ID model yang tersedia di: https://openrouter.ai/models?q=free\n"
+                f"Lalu ubah MODEL_ANALYSIS / MODEL_HELPER di utils/text_generator.py"
+            ) from e
+        raise
+
+
+# ─── Public API Functions ─────────────────────────────────────────────────────
 
 def generate_analysis(data: dict, api_key: str) -> Generator[str, None, None]:
-    """
-    Generate analisis dan kesimpulan via OpenRouter — model Nemotron (streaming).
-    Seed acak menjamin frasa selalu berbeda tiap generate.
-    """
+    """Generate analisis dan kesimpulan (streaming) — model analisis berat."""
     client = _get_client(api_key)
     seed = random.randint(1000, 99999)
     prompt = _build_analysis_prompt(data, seed)
-
-    stream = client.chat.completions.create(
+    yield from _stream(
+        client,
         model=MODEL_ANALYSIS,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -181,21 +207,15 @@ def generate_analysis(data: dict, api_key: str) -> Generator[str, None, None]:
         ],
         temperature=1.0,
         max_tokens=3500,
-        stream=True,
     )
-
-    for chunk in stream:
-        delta = chunk.choices[0].delta.content
-        if delta:
-            yield delta
 
 
 def generate_langkah_kerja(context: dict, api_key: str) -> Generator[str, None, None]:
-    """Generate langkah kerja via OpenRouter — model helper (streaming)."""
+    """Generate langkah kerja (streaming) — model helper ringan."""
     client = _get_client(api_key)
     prompt = _build_langkah_kerja_prompt(context)
-
-    stream = client.chat.completions.create(
+    yield from _stream(
+        client,
         model=MODEL_HELPER,
         messages=[
             {
@@ -210,13 +230,7 @@ def generate_langkah_kerja(context: dict, api_key: str) -> Generator[str, None, 
         ],
         temperature=0.7,
         max_tokens=700,
-        stream=True,
     )
-
-    for chunk in stream:
-        delta = chunk.choices[0].delta.content
-        if delta:
-            yield delta
 
 
 def adjust_content(
@@ -225,11 +239,11 @@ def adjust_content(
     section_name: str,
     api_key: str,
 ) -> Generator[str, None, None]:
-    """Edit konten yang sudah ada via OpenRouter — model helper (streaming)."""
+    """Edit konten yang sudah ada (streaming) — model helper ringan."""
     client = _get_client(api_key)
     prompt = _build_adjust_prompt(current_content, instruction, section_name)
-
-    stream = client.chat.completions.create(
+    yield from _stream(
+        client,
         model=MODEL_HELPER,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -237,10 +251,4 @@ def adjust_content(
         ],
         temperature=0.85,
         max_tokens=3500,
-        stream=True,
     )
-
-    for chunk in stream:
-        delta = chunk.choices[0].delta.content
-        if delta:
-            yield delta
